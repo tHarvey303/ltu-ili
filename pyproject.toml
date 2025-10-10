@@ -31,6 +31,11 @@ pytorch = [
     "lampe;python_version>='3.7'",
     "dask-ml;python_version>='3.7'",
 ]
+jax = [
+    "jax;python_version>='3.7'",
+    "jaxlib;python_version>='3.7'",
+    "blackjax;python_version>='3.7'",
+]
 tensorflow = [
     "tensorflow==1.15;python_version<'3.7'",
     "dask-ml<2.0;python_version<'3.7'",
