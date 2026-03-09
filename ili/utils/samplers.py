@@ -4,6 +4,7 @@ Ratio Estimation models. Currently supports emcee samplers for both sbi
 and pydelfi backends, and pyro samplers only for the sbi backend.
 """
 
+import logging
 import os
 import numpy as np
 import emcee
@@ -18,6 +19,8 @@ try:
         DirectPosterior, MCMCPosterior, VIPosterior)
     from sbi.inference.potentials.posterior_based_potential import (
         posterior_estimator_based_potential)
+    from sbi.utils.sbiutils import within_support
+    from tqdm.auto import tqdm
     ModelClass = NeuralPosterior
     try:  # sbi > 0.22.0
         from sbi.inference.posteriors import EnsemblePosterior
@@ -238,6 +241,192 @@ class DirectSampler(ABC):
             (nsteps,), x=x,
             show_progress_bars=progress
         ).detach().cpu().numpy()
+
+    def sample_batched(
+        self,
+        nsteps: int,
+        x: Any,
+        samples_per_draw: int = 5_000,
+        show_progress_bars: bool = True,
+    ) -> np.ndarray:
+        """Sample from a batch of observations using progressive batch shrinkage.
+
+        Each iteration evaluates the flow over all observations that still need
+        more samples in a single GPU forward pass. Once an observation has
+        collected enough accepted samples it is removed from the active batch,
+        so no observation gates others and GPU utilisation remains high
+        throughout.
+
+        This avoids two problems present in sbi's built-in
+        ``DirectPosterior.sample_batched``:
+
+        1. The min-gating bug: the inner loop decrements ``num_remaining`` by
+           the *minimum* accepted count across all observations, so a single
+           high-leakage observation forces the loop to keep sampling for every
+           already-finished observation.
+        2. The batch-size cap: ``max_sampling_batch_size`` is divided by the
+           number of observations, collapsing GPU parallelism for large batches.
+
+        For ``EnsemblePosterior`` objects the method delegates to
+        ``_sample_batched_ensemble``.
+
+        Args:
+            nsteps: Number of accepted posterior samples to collect per
+                observation.
+            x: Batch of observations, shape ``(N, feature_dim)``.
+            samples_per_draw: Candidate samples drawn per observation per
+                iteration.  The total forward-pass size each iteration is
+                ``samples_per_draw * n_active``, which shrinks naturally as
+                observations complete.
+            show_progress_bars: Whether to show a tqdm progress bar.
+
+        Returns:
+            Array of shape ``(N, nsteps, theta_dim)``.
+        """
+        posterior = self.posterior
+
+        if isinstance(posterior, EnsemblePosterior):
+            return self._sample_batched_ensemble(
+                posterior, nsteps, x, samples_per_draw, show_progress_bars
+            )
+
+        if not hasattr(posterior, "posterior_estimator"):
+            raise RuntimeError(
+                "sample_batched requires a DirectPosterior with a "
+                ".posterior_estimator attribute. Use sample() for other "
+                "posterior types."
+            )
+
+        estimator = posterior.posterior_estimator
+        prior = posterior.prior
+        device = getattr(posterior, "_device", "cpu")
+
+        x_tensor = torch.as_tensor(
+            np.asarray(x), dtype=torch.float32, device=device
+        )
+        N = x_tensor.shape[0]
+        theta_dim = int(torch.tensor(estimator.input_shape).prod().item())
+
+        accepted: list[list[torch.Tensor]] = [[] for _ in range(N)]
+        counts = torch.zeros(N, dtype=torch.long)
+        total_drawn = torch.zeros(N, dtype=torch.long)
+        active = list(range(N))
+
+        pbar = tqdm(
+            total=N * nsteps,
+            desc=f"Batched sampling ({N} observations)",
+            disable=not show_progress_bars,
+        )
+
+        with torch.no_grad():
+            estimator.eval()
+            while active:
+                n_active = len(active)
+                active_x = x_tensor[active]  # (n_active, feature_dim)
+
+                # Single forward pass for all remaining observations.
+                # Output shape: (samples_per_draw, n_active, theta_dim)
+                candidates = estimator.sample(
+                    torch.Size((samples_per_draw,)), condition=active_x
+                )
+
+                # Vectorised prior support check.
+                flat = candidates.reshape(-1, theta_dim)
+                in_support = within_support(prior, flat).reshape(
+                    samples_per_draw, n_active
+                )
+                total_drawn[active] += samples_per_draw
+
+                newly_done = []
+                for local_i, global_i in enumerate(active):
+                    mask = in_support[:, local_i]
+                    good = candidates[mask, local_i]
+                    n_new = good.shape[0]
+                    if n_new > 0:
+                        accepted[global_i].append(good.cpu())
+                        prev = int(counts[global_i].item())
+                        counts[global_i] += n_new
+                        increment = min(n_new, nsteps - prev)
+                        if increment > 0:
+                            pbar.update(increment)
+                    if counts[global_i] >= nsteps:
+                        newly_done.append(global_i)
+
+                for global_i in newly_done:
+                    active.remove(global_i)
+
+        pbar.close()
+
+        rates = (counts.float() / total_drawn.float().clamp(min=1)).numpy()
+        low, med, high = np.percentile(rates, [16, 50, 84])
+        logging.debug(
+            "Batched sampling acceptance rates — "
+            f"16th/50th/84th: {low:.2%} / {med:.2%} / {high:.2%}"
+        )
+        if med < 0.01:
+            logging.warning(
+                f"Median acceptance rate is only {med:.2%}. Sampling may be "
+                "slow. Consider wider priors or switching to MCMC."
+            )
+
+        return np.stack([
+            torch.cat(accepted[i], dim=0)[:nsteps].numpy()
+            for i in range(N)
+        ])
+
+    def _sample_batched_ensemble(
+        self,
+        posterior: "EnsemblePosterior",
+        nsteps: int,
+        x: Any,
+        samples_per_draw: int,
+        show_progress_bars: bool,
+    ) -> np.ndarray:
+        """Batched sampling for EnsemblePosterior.
+
+        Assigns samples to components via multinomial draw matching the
+        ensemble weights, then calls ``sample_batched`` on each component
+        posterior independently.
+
+        Args:
+            posterior: The EnsemblePosterior to sample from.
+            nsteps: Samples to collect per observation.
+            x: Observations, shape ``(N, feature_dim)``.
+            samples_per_draw: Passed through to each component's
+                ``sample_batched`` call.
+            show_progress_bars: Passed through to each component.
+
+        Returns:
+            Array of shape ``(N, nsteps, theta_dim)``.
+        """
+        x_arr = np.asarray(x)
+        N = x_arr.shape[0]
+
+        # Assign each of the nsteps draws to a component via multinomial.
+        component_indices = torch.multinomial(
+            posterior._weights, nsteps, replacement=True
+        )
+        unique_comps, comp_sizes = component_indices.unique(return_counts=True)
+
+        per_galaxy: list[list[np.ndarray]] = [[] for _ in range(N)]
+
+        for comp_idx, comp_size in zip(
+            unique_comps.tolist(), comp_sizes.tolist()
+        ):
+            comp_posterior = posterior.posteriors[comp_idx]
+            temp_sampler = DirectSampler(comp_posterior)
+            # Shape: (N, comp_size, theta_dim)
+            comp_samples = temp_sampler.sample_batched(
+                comp_size, x_arr, samples_per_draw,
+                show_progress_bars=show_progress_bars,
+            )
+            for i in range(N):
+                per_galaxy[i].append(comp_samples[i])
+
+        return np.stack([
+            np.concatenate(per_galaxy[i], axis=0)[:nsteps]
+            for i in range(N)
+        ])
 
 
 class VISampler(ABC):
