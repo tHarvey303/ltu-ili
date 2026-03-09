@@ -318,24 +318,34 @@ class DirectSampler(ABC):
             disable=not show_progress_bars,
         )
 
+        # Maximum total samples across all active observations per forward pass.
+        # Keeps the kernel launch within GPU hardware limits (e.g. AMD HIP and
+        # NVIDIA CUDA both fail above ~2^24 elements in a single launch).
+        # samples_per_draw is the *per-observation* budget; the actual draw is
+        # capped so that samples_per_draw * n_active <= max_total_per_pass.
+        max_total_per_pass = 50_000
+
         with torch.no_grad():
             estimator.eval()
             while active:
                 n_active = len(active)
                 active_x = x_tensor[active]  # (n_active, feature_dim)
 
+                # Scale per-obs draw count so total stays within GPU limits.
+                effective_draw = max(1, min(samples_per_draw, max_total_per_pass // n_active))
+
                 # Single forward pass for all remaining observations.
-                # Output shape: (samples_per_draw, n_active, theta_dim)
+                # Output shape: (effective_draw, n_active, theta_dim)
                 candidates = estimator.sample(
-                    torch.Size((samples_per_draw,)), condition=active_x
+                    torch.Size((effective_draw,)), condition=active_x
                 )
 
                 # Vectorised prior support check.
                 flat = candidates.reshape(-1, theta_dim)
                 in_support = within_support(prior, flat).reshape(
-                    samples_per_draw, n_active
+                    effective_draw, n_active
                 )
-                total_drawn[active] += samples_per_draw
+                total_drawn[active] += effective_draw
 
                 newly_done = []
                 for local_i, global_i in enumerate(active):
