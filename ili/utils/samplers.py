@@ -310,7 +310,9 @@ class DirectSampler(ABC):
         accepted: list[list[torch.Tensor]] = [[] for _ in range(N)]
         counts = torch.zeros(N, dtype=torch.long)
         total_drawn = torch.zeros(N, dtype=torch.long)
-        active = list(range(N))
+        # Boolean mask on CPU; active observations are True.
+        # Tensor indexing via nonzero() avoids O(N²) list.remove() cost.
+        active_mask = torch.ones(N, dtype=torch.bool)
 
         pbar = tqdm(
             total=N * nsteps,
@@ -327,9 +329,10 @@ class DirectSampler(ABC):
 
         with torch.no_grad():
             estimator.eval()
-            while active:
-                n_active = len(active)
-                active_x = x_tensor[active]  # (n_active, feature_dim)
+            while active_mask.any():
+                active_indices = active_mask.nonzero(as_tuple=True)[0]  # (n_active,)
+                n_active = active_indices.shape[0]
+                active_x = x_tensor[active_indices]  # (n_active, feature_dim)
 
                 # Scale per-obs draw count so total stays within GPU limits.
                 effective_draw = max(1, min(samples_per_draw, max_total_per_pass // n_active))
@@ -341,29 +344,35 @@ class DirectSampler(ABC):
                 )
 
                 # Vectorised prior support check.
+                # in_support: (effective_draw, n_active) boolean on CPU
                 flat = candidates.reshape(-1, theta_dim)
                 in_support = within_support(prior, flat).reshape(
                     effective_draw, n_active
-                )
-                total_drawn[active] += effective_draw
+                ).cpu()
+                total_drawn[active_indices] += effective_draw
 
-                newly_done = []
-                for local_i, global_i in enumerate(active):
+                # Per-observation accepted counts — one GPU reduction, no Python loop.
+                new_per_obs = in_support.sum(dim=0)  # (n_active,) long
+
+                # Update progress bar: credit newly accepted up to nsteps per obs.
+                prev_counts = counts[active_indices].clone()
+                counts[active_indices] += new_per_obs
+                capped_increment = (
+                    new_per_obs - (prev_counts + new_per_obs - nsteps).clamp(min=0)
+                ).clamp(min=0)
+                pbar.update(int(capped_increment.sum().item()))
+
+                # Collect actual samples — iterate only over obs that got ≥1 sample.
+                got_samples = new_per_obs.nonzero(as_tuple=True)[0]
+                for local_i in got_samples.tolist():
+                    global_i = int(active_indices[local_i].item())
                     mask = in_support[:, local_i]
-                    good = candidates[mask, local_i]
-                    n_new = good.shape[0]
-                    if n_new > 0:
-                        accepted[global_i].append(good.cpu())
-                        prev = int(counts[global_i].item())
-                        counts[global_i] += n_new
-                        increment = min(n_new, nsteps - prev)
-                        if increment > 0:
-                            pbar.update(increment)
-                    if counts[global_i] >= nsteps:
-                        newly_done.append(global_i)
+                    accepted[global_i].append(candidates[mask, local_i].cpu())
 
-                for global_i in newly_done:
-                    active.remove(global_i)
+                # Drop completed observations from the active set (vectorised).
+                done_local = (counts[active_indices] >= nsteps)
+                if done_local.any():
+                    active_mask[active_indices[done_local]] = False
 
         pbar.close()
 
