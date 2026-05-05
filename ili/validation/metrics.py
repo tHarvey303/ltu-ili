@@ -14,7 +14,8 @@ from scipy.stats import gaussian_kde
 import logging
 import tarp
 from ili.utils.samplers import (EmceeSampler, PyroSampler,
-                                DirectSampler, VISampler)
+                                DirectSampler, VISampler,
+                                BlackjaxNestedSampler)
 
 try:
     from sbi.inference.posteriors.base_posterior import NeuralPosterior
@@ -90,6 +91,9 @@ class _SampleBasedMetric(_BaseMetric):
         """
         if self.sample_method == 'emcee':
             return EmceeSampler(posterior, **self.sample_params)
+        
+        if self.sample_method == 'blackjax_nested':
+            return BlackjaxNestedSampler(posterior, **self.sample_params)
 
         # check if pytorch backend is available
         global backend

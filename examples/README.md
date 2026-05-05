@@ -18,3 +18,16 @@ To try other inference models (i.e. likelihood or ratio estimation) with the toy
 python toy_sbi.py --model SNLE
 python toy_sbi.py --model SNRE
 ```
+
+## BlackJax Nested Sampling Example
+
+We also provide an example demonstrating the use of the BlackjaxNestedSampler for nested sampling with Neural Likelihood Estimation:
+```bash
+cd examples
+python example_blackjax_nested_sampler.py
+```
+
+This example shows how to use nested sampling for computing Bayesian evidence and sampling from multi-modal posteriors. Note that this requires the `blackjax` and `jax` packages to be installed:
+```bash
+pip install blackjax jax jaxlib
+```

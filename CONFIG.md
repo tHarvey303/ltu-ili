@@ -222,20 +222,33 @@ metrics:
         num_chains: 7
         burn_in: 100
         thin: 1
+  
+  # use nested sampling for multi-modal posteriors and evidence computation
+  nested_sampling:
+    module: 'ili.validation.metrics'
+    class: 'PosteriorSamples'
+    args:
+      num_samples: 1000
+      sample_method: 'blackjax_nested'
+      sample_params:
+        num_live_points: 500
+        max_samples: 10000
+        term_cond:
+          dlogz: 0.1
 ```
 All current implemented validation metrics follow the general formula of:
 1. Pass the test inputs through the neural networks and estimate a posterior model.
 2. Generate `num_sample` samples from the posterior for each input.
 3. Compute a comparison metric between the posterior samples and the true values. Plot it and save the figure to `output_path`.
 
-There are two available sampler backends in [`ili.utils.samplers`](ili/utils/samplers.py) to generate posterior samples, one that uses PyTorch's [`pyro`](https://github.com/pyro-ppl/pyro) and one that uses [`emcee`](https://github.com/dfm/emcee). The choice of training engine will constrain which sampler you can use.
+There are two available sampler backends in [`ili.utils.samplers`](ili/utils/samplers.py) to generate posterior samples, one that uses PyTorch's [`pyro`](https://github.com/pyro-ppl/pyro) and one that uses [`emcee`](https://github.com/dfm/emcee). Additionally, we provide a [`blackjax`](https://blackjax-devs.github.io/blackjax/) nested sampling implementation for computing Bayesian evidence and sampling from multi-modal posteriors. The choice of training engine will constrain which sampler you can use.
 - `pydelfi` models can only use the `emcee` sampler.
-- `sbi`'s `NLE` or `NRE` models can use either the `emcee` or `pyro` samplers. The `pyro` samplers include several MCMC methods like slice sampling (`'slice_np'`, `'slice_np_vectorized'`), Hamiltonian Monte Carlo (`'hmc'`), and the NUTS sampler (`'nuts'`). From my experience, `slice_np_vectorized` works the fastest on CPU architectures for simple posteriors.
-- `sbi`'s and `lampe`'s `NPE` models can use any of the `emcee` or `pyro` samplers. However, as they are amortized posterior estimators, they can also do fast direct estimation of the `log_prob` of samples, thus allowing for super fast Rejection Sampling. It is recommended to use this with the `'direct'` sample method for `NPE` models.
+- `sbi`'s `NLE` or `NRE` models can use either the `emcee`, `pyro`, or `blackjax_nested` samplers. The `pyro` samplers include several MCMC methods like slice sampling (`'slice_np'`, `'slice_np_vectorized'`), Hamiltonian Monte Carlo (`'hmc'`), and the NUTS sampler (`'nuts'`). From my experience, `slice_np_vectorized` works the fastest on CPU architectures for simple posteriors. The `blackjax_nested` sampler is useful for computing Bayesian evidence and exploring multi-modal posteriors.
+- `sbi`'s and `lampe`'s `NPE` models can use any of the `emcee`, `pyro`, or `blackjax_nested` samplers. However, as they are amortized posterior estimators, they can also do fast direct estimation of the `log_prob` of samples, thus allowing for super fast Rejection Sampling. It is recommended to use this with the `'direct'` sample method for `NPE` models.
 
 The `ensemble_mode` parameter allows you to specify whether you want to sample jointly from the ensemble of neural networks trained in your inference stage (`True`) or from each one individually (`False`). This can be useful for analyzing multiple trained architectures individually or for debugging for issues in training.
 
-The `sampler_params` interface for specifying the number, length, and thinning of MCMC chains has been made identical for all implemented samplers.
+The `sampler_params` interface for specifying the number, length, and thinning of MCMC chains has been made identical for all implemented samplers. For the `blackjax_nested` sampler, you can specify `num_live_points` (default: 500), `max_samples` (default: None), and `term_cond` (default: `{'dlogz': 0.1}`) to control the nested sampling process.
 
 ## Overloading configuration files
 Lastly, we provide the ability to overload configuration files within the `.from_config` function of each stage. This is very useful for running multipl experiments with the same base configuration file, but with slight changes to the hyperparameters. For example, if you wanted to run the same experiment with different learning rates, you could do:
